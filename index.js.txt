@@ -1,0 +1,108 @@
+JavaScript
+require('dotenv').config();
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const mongoose = require('mongoose');
+const qrcode = require('qrcode-terminal');
+
+// 1. KONEKSI DATABASE MONGOOSE
+mongoose.connect(process.env.MONGODB_URL).then(() => {
+    console.log("Terhubung ke MongoDB Cloud!");
+    connectToWhatsApp();
+}).catch(err => console.error("Gagal konek MongoDB:", err));
+
+// Skema untuk menyimpan session di MongoDB
+const AuthSchema = new mongoose.Schema({
+    _id: String,
+    value: String
+});
+const AuthModel = mongoose.model('Auth', AuthSchema);
+
+// 2. FUNGSI UTAMA WHATSAPP
+async function connectToWhatsApp() {
+    // Pengaturan Session Custom menggunakan MongoDB
+    // (Agar data auth disimpan di DB, bukan di file local server)
+    const useMongoDBAuthState = async () => {
+        const creds = await AuthModel.findById('creds');
+        return {
+            state: {
+                creds: creds ? JSON.parse(creds.value) : undefined,
+                keys: {
+                    get: async (type, ids) => {
+                        const data = {};
+                        for (const id of ids) {
+                            const res = await AuthModel.findById(`${type}-${id}`);
+                            if (res) data[id] = JSON.parse(res.value);
+                        }
+                        return data;
+                    },
+                    set: async (data) => {
+                        for (const type in data) {
+                            for (const id in data[type]) {
+                                const value = data[type][id];
+                                const key = `${type}-${id}`;
+                                if (value) {
+                                    await AuthModel.findByIdAndUpdate(key, { value: JSON.stringify(value) }, { upsert: true });
+                                } else {
+                                    await AuthModel.findByIdAndDelete(key);
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            saveCreds: async () => {
+                const currentCreds = sock.authState.creds;
+                await AuthModel.findByIdAndUpdate('creds', { value: JSON.stringify(currentCreds) }, { upsert: true });
+            }
+        };
+    };
+
+    const { state, saveCreds } = await useMongoDBAuthState();
+
+    const sock = makeWASocket({
+        auth: state,
+        printQRInTerminal: false // Kita matikan terminal bawaan agar bisa kita atur sendiri log-nya
+    });
+
+    // Menangani Event Update (QR Code & Koneksi)
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        
+        if (qr) {
+            // Ini yang akan memunculkan QR Code besar di Log Server Render nanti
+            qrcode.generate(qr, { small: true });
+            console.log("👉 SCAN QR CODE DI ATAS MENGGUNAKAN HP KAMU!");
+        }
+
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect.error instanceof Boom) ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut : true;
+            console.log('Koneksi terputus karena: ', lastDisconnect.error, ', mencoba menghubungkan kembali...', shouldReconnect);
+            if (shouldReconnect) {
+                connectToWhatsApp();
+            }
+        } else if (connection === 'open') {
+            console.log('✅ BOT WHATSAPP BERHASIL TERHUBUNG DAN AKTIF!');
+        }
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    // 3. LOGIKA MERESPONS PESAN (Fitur Bot Kamu)
+    sock.ev.on('messages.upsert', async m => {
+        const msg = m.messages[0];
+        if (!msg.message || msg.key.fromMe) return; // Abaikan jika pesan kosong atau dari diri sendiri
+
+        const from = msg.key.remoteJid;
+        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+
+        console.log(`Menerima pesan dari ${from}: ${text}`);
+
+        // Contoh Fitur Auto-Reply Sederhana
+        if (text.toLowerCase() === 'p') {
+            await sock.sendMessage(from, { text: 'Halo! Ada yang bisa bot bantu?' });
+        } else if (text.toLowerCase() === 'info') {
+            await sock.sendMessage(from, { text: 'Bot ini berjalan 24 jam nonstop di Cloud! 🚀' });
+        }
+    });
+}
